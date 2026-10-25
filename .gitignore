@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# firmware images and dumps: never commit board images (MAC/serial/UUID live in
+# the stock dump, and vendor ROMs are not redistributable)
+*.rom
+*.bin
+*.rom.*
+*.bin.*
+*.rom
+bios.layout
+*.mmtool.log
+
+# MMTool is a proprietary AMI binary - fetch it from your own firmware package
+*.exe
+MMTOOL_*.exe
