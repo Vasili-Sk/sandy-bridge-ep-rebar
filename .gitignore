@@ -12,6 +12,7 @@ venv/
 *.bin.*
 *.rom
 bios.layout
+bios-backups/
 *.mmtool.log
 
 # MMTool is a proprietary AMI binary - fetch it from your own firmware package

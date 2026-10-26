@@ -1,0 +1,13 @@
+# Normalise line endings on commit; the repo stores LF.
+* text=auto
+
+# flash.sh runs under bash on a Linux host that is about to reflash its own
+# firmware and reboot. A stray CR there is a broken command line on the box.
+*.sh    text eol=lf
+
+*.py    text eol=lf
+*.md    text eol=lf
+
+# The POST logo payload is binary. Never let a text filter touch it.
+*.dat   binary
+logo/*  binary
