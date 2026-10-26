@@ -130,7 +130,12 @@ NCB 2  0xDD0000  len 0x030000
 ```
 
 All three FV headers: `_FVH`, `HeaderLength = 0x48`, FFS files start at `fv + 0x48`.
-No nested FV.
+No nested FV. The counts in the table and in §3's summary are MMTool's; a raw
+FFS walk of the same image counts 142 in FV 01 and 28 in FV 02 because it also
+yields entries MMTool's summary omits (types `0x01`/`0x02`/`0x05`/`0x06`/`0x09`/
+`0x0A`/`0x0C`/`0x0D`/`0x0F`/`0xF0` all live in these volumes). Every file in all
+three volumes closes both FFS checksums under the raw walk, in stock and in every
+built image — that is the number `verify_image.py` compares.
 
 | # | Name | GUID | Location | Compressed | Uncompressed |
 |---|---|---|---|---|---|
@@ -141,8 +146,43 @@ No nested FV.
 | **010/PEI** | **IvtQpiandMrcInit** (FV 02) | **`5C08C7C8-24C2-4400-9627-CF2869421E06`** | `0xE26000` | — | 457,920 |
 
 `IvtQpiandMrcInit` is stored **uncompressed** in FV02, so patch 1 is a raw-image
-byte patch. `PciRootBridge` is stored **compressed** in FV01, so patch 2 needs
-MMTool.
+byte patch. `PciRootBridge` is stored **compressed** in FV01: `patch_aperture.py`
+expands it, patches it, re-compresses it and repacks the volume, all in Python
+(see §3.1).
+
+### 3.1 The AMI/EDK2 COMPRESSION section (measured, module 009)
+
+Module 009 is `hdr(24) + DEPEx(0x4C) + COMPRESSION(0xB237)`, 8-byte aligned in
+FV01. The compression section body is
+
+```
++0   u24 size + u8 type (0x01 = EFI_SECTION_COMPRESSION)
++4   u32 DestinationSize
++8   u8  CompressionType (0x01 = Tiano/LZH on this image, NOT EFI/LZMA)
++9   u32 CompressedSize
++13  u32 DestinationSize (repeated)
++17  bitstream                       (13 + CompressedSize == section body length)
+```
+
+The buffer handed to the Tiano decoder starts at **+9**: `[CompressedSize]
+[DestinationSize][bitstream]`. `TianoCompress()` from the `uefi-firmware` package
+returns exactly that framing, so a re-compressed stream drops into the section
+with no reshaping. Measured on module 009: 45,614 B decoder buffer → 90,372 B;
+re-compressing that payload gives 45,628 B (+14 in the stream, +19 in the file)
+and re-decompresses **byte-identical**.
+
+The payload is **the remaining sections of the file**, not a bare PE32 image
+(standard `EFI_COMPRESSION2` semantics):
+
+```
+PE32(0x160E4, body 0x160E0 = 90,336 B, starts "MZ") + USER_INTERFACE(0x20)  = 90,372 B
+```
+
+so `hdr + DEPEx + <those two sections>` = 90,472 B = exactly what MMTool's `/e`
+extract of the same module contains, byte for byte. `patch_aperture.py
+--reference-extract <extract>` asserts that identity. The two aperture patch
+sites are at PE32-body offsets `0x235d`/`0x237a` = module-file offsets
+`0x23c5`/`0x23e2`.
 
 ### Firmware-side facts proven by disassembly (`IvtQpiandMrcInit`, imagebase `0xffe26058`)
 
@@ -354,15 +394,30 @@ Exit codes: MMTool exits 0 on success; on its own error path it exits
 
 Consequences:
 
-1. Any DSDT/module edit forces a full FV repack. Do the MMTool step **first**,
-   then apply byte patches **by pattern, never by hard-coded offset** — offsets
-   move.
+1. Any DSDT/module edit that changes a module's size forces an FV repack. Do the
+   repacking step **first**, then apply byte patches **by pattern, never by
+   hard-coded offset** — offsets move. `patch_aperture.py` repacks FV01 itself:
+   it shifts every following FFS file by the 8-aligned size delta (so all files
+   stay 8-byte aligned) and shrinks the volume's trailing `0xFF` free space by
+   exactly the same amount, which keeps the image exactly 16 MiB. A shift that is
+   not a multiple of 8 corrupts the volume: measure the delta between the
+   *aligned* footprints, and drop the freed bytes from the **end** of the volume,
+   not from the front of the file stream.
 2. There is no way to keep a module compressed *and* patch its contents with
-   MMTool alone, and no open encoder reproduces AMI's compressor (measured:
-   `TianoCompress` 3,821 B, `EfiCompress` 3,769 B, `LzmaCompress` 2,732 B vs the
-   ROM's 3,687 B stream; brute-force LZMA1/LZMA_ALONE decode at every offset and
-   every property byte finds no valid stream). So a compressed module must be
-   stored uncompressed after editing.
+   MMTool alone, and no open encoder reproduces AMI's compressor *byte-for-byte*
+   (measured on the 3,687 B logo stream: `TianoCompress` 3,821 B, `EfiCompress`
+   3,769 B, `LzmaCompress` 2,732 B; brute-force LZMA1/LZMA_ALONE decode at every
+   offset and every property byte finds no valid stream). Byte-for-byte equality
+   is **not** required: a stream freshly produced by the EDK2 `TianoCompress`
+   decodes correctly through the EDK2 `TianoDecompress` that the firmware uses,
+   which is what `patch_aperture.py` relies on. Recompressing in place moves
+   FV01 by 16 bytes; storing the module uncompressed (MMTool's `/r` shape, the
+   `--store-uncompressed` cross-check) moves it by 44,744.
+3. MMTool's `/r` repack is not surgical: measured against a stock baseline, the
+   MMTool-built image differs from stock in **two** FV01 modules' decompressed
+   contents (module 009 plus `EFD652CC-0E99-40F0-96C0-E08C089070FC`), while the
+   pure-Python repack differs in exactly one. Prefer the pure-Python path when
+   you want a minimal, explainable diff.
 
 ---
 
@@ -502,9 +557,10 @@ Other rules:
    the firmware-volume checksum as interchangeable. They are four different
    fields with four different rules.
 10. **Verify before you flash, and believe the verifier only if it re-derives.**
-    `verify_image.py` re-walks the volumes, re-disassembles both patch sites and
-    recomputes the aperture arithmetic from the emitted immediates. It does not
-    read the patchers' output.
+    `verify_image.py` re-walks the volumes, detects which patches an image
+    carries, re-decompresses the patched module out of the image, re-disassembles
+    the sites it finds and recomputes the aperture arithmetic from the emitted
+    immediates. It does not read the patchers' output.
 11. Never flash without a recovery path: a CH341A-class programmer and a
     known-good dump. A board that will not POST has no other escape.
 
@@ -522,6 +578,15 @@ Other rules:
   `amdgpu` probes, `VRAM: 65520M`, `/dev/kfd` present, `rocminfo` works.
 * MMTool CLI cracked; lossless `/ec`+`/rc` round-trip verified byte-exact;
   `/r` round-trip of an unmodified `/e` extract is byte-exact too.
+* Patch 2 built into an image **without MMTool**, by `patch_aperture.py` alone
+  (Tiano decode → patch → Tiano re-encode → FV01 repack → both FFS checksums
+  closed). `verify_image.py` passes on both shapes it can emit (recompressed,
+  16-byte shift; uncompressed, 44,744-byte shift), every FFS checksum in all
+  three volumes closes, MMTool's own volume walk of the result is unchanged from
+  stock (FV00 = 1, FV01 = 140, FV02 = 26), and nothing outside FV01 differs from
+  stock. The pure-Python rebuild of the unpatched module is byte-identical to
+  MMTool's `/e` extract, and the module file the `--store-uncompressed` path
+  writes is byte-identical to the one the MMTool route feeds to `/r`.
 
 **Not proven on hardware:**
 
@@ -530,3 +595,7 @@ Other rules:
   the table the OS reads, so the risk is low — but a flash is not a table
   override. If you want zero untested flash, ship patch 1 in flash and patch 2 as
   the initrd override.
+* A **re-compressed** module booting on the board. The re-compressed stream is
+  produced and consumed by the EDK2 Tiano codec and round-trips byte-identical,
+  and the volume passes every structural check, but the image has not been
+  flashed and POSTed.

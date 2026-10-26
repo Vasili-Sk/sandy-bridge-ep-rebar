@@ -13,7 +13,7 @@ Two independent defects block a large BAR. Both are patched here.
 | | defect | patch | needs MMTool? |
 |---|---|---|---|
 | **1** | 64-bit MMIO aperture (MMIOH) hard-coded to **1 TiB**; the size variable is unwired to any setup question | `patch_mmioh.py` — raise it to **8 TiB** | no |
-| **2** | the root-bridge **32-bit** aperture published in the DSDT *contains ECAM*, so Linux hands out BARs that alias PCI config space | `patch_aperture.py` — subtract ECAM | yes |
+| **2** | the root-bridge **32-bit** aperture published in the DSDT *contains ECAM*, so Linux hands out BARs that alias PCI config space | `patch_aperture.py` — subtract ECAM | no (optional fallback) |
 
 **Patch 1 is the ReBAR enabler.** On its own it is enough for a GPU whose BAR
 fits in the 32-bit window plus the 8 TiB 64-bit window. Patch 2 is needed when
@@ -22,7 +22,10 @@ lands it on ECAM.
 
 ## Quick start
 
-Requires Python 3.8+. No third-party packages.
+Patch 1 runs on Python 3.8+ with no third-party packages. Patch 2 also needs the
+EDK2 codecs from `uefi-firmware`, which publishes wheels for **Python 3.10+**
+(`pip install -r requirements.txt`, see below) — on an older interpreter, use the
+MMTool fallback for patch 2.
 
 ```bash
 # unpack the .zip Supermicro gives you; use the raw SPI image inside
@@ -43,17 +46,59 @@ bytes changed      8
 `--size` takes any power of two up to `0xFFFF` GiB; the script refuses anything
 whose window would end above the CPU's physical address limit.
 
-## Patch 2 (needs MMTool 4.50, from your firmware package)
+## Patch 2 (pure Python: Tiano de/compression in-process)
 
-Module 009 is stored **compressed** and AMI's compressor is proprietary — no
-open encoder reproduces it, so MMTool has to expand it first.
+Module 009 `PciRootBridge` is stored **Tiano/LZH-compressed** inside FV01, so
+patching it means decompressing, editing, re-compressing and repacking the
+volume. `patch_aperture.py` does all of that itself on the raw image:
+
+```bash
+pip install -r requirements.txt        # uefi-firmware (compiled EDK2 codecs) + capstone
+python patch_aperture.py X9DRGQF8.921 -o patched.bin
+```
+
+What it does, all measured against this image:
+
+* locates the FFS file by GUID, splits `hdr + DEPEx + COMPRESSION`, and Tiano-
+  decompresses the section — whose payload is itself a section stream
+  (`PE32 + USER_INTERFACE`), not a bare PE32 image;
+* replaces the two 7-byte loads of the MMIO32 base/length struct fields with
+  `mov r9d, imm32` + `nop`, asserting each pattern occurs exactly once;
+* re-compresses the payload with the same codec (the stream is 22 bytes larger
+  than AMI's; the module grows by 19 bytes and FV01 shifts by 16) and closes
+  both live FFS checksums;
+* repacks FV01 in place: every following FFS file moves by the 8-aligned delta,
+  the volume's trailing `0xFF` free space gives up exactly that many bytes, the
+  image stays exactly 16 MiB, and everything outside FV01 is byte-identical;
+* re-reads the file it wrote and re-verifies all of it from the bytes.
+
+It refuses — non-zero exit, no output file — if the module is missing, a
+pattern is not unique, the volume's block map is not a power-of-two layout, the
+free space is insufficient, the decode does not reproduce the module, or a
+checksum does not close.
+
+Useful switches: `--module-out FILE` writes just the rebuilt module;
+`--store-uncompressed` stores the module uncompressed (MMTool's `/r` shape,
+grows the module to 90,472 bytes and shifts FV01 by ~45 KB) as a cross-check;
+`--reference-extract FILE` asserts that the pure-Python rebuild of the
+*unpatched* module is byte-for-byte identical to an MMTool `/e` extract — the
+gate that proves the (de)compression and framing are exact.
+
+### MMTool fallback (optional, documented)
+
+If you prefer AMI's own tool to do the repack, the module route still works and
+needs no Python packages:
 
 ```bash
 MMTOOL_4.50.0.23.exe X9DRGQF8.921 /e 80E66E0A-CCD1-43FA-A7B1-2D5EE0F13910 PciRootBridge.bin
-python patch_aperture.py PciRootBridge.bin -o PciRootBridge.patched.bin
+python patch_aperture.py X9DRGQF8.921 --from-extract PciRootBridge.bin \
+       --store-uncompressed --no-write --module-out PciRootBridge.patched.bin
 MMTOOL_4.50.0.23.exe X9DRGQF8.921 /r 80E66E0A-CCD1-43FA-A7B1-2D5EE0F13910 PciRootBridge.patched.bin
 python patch_mmioh.py X9DRGQF8.921 -o patched.bin
 ```
+
+The module written by `--module-out` is byte-identical to the one the pure-Python
+`--store-uncompressed` path produces.
 
 MMTool is a GUI-subsystem binary with a text UI, so it looks like it hangs.
 `tools/mmtool_run.py` drives it through a real console and always cleans up:
@@ -71,9 +116,11 @@ or MSYS rewrites `/e` into `E:/` and MMTool drops into its interactive menu.
 python verify_image.py X9DRGQF8.921 patched.bin
 ```
 
-It trusts nothing: it re-walks all three firmware volumes, re-disassembles both
-patch sites, recomputes the aperture arithmetic from the emitted immediates, and
-asserts every FFS checksum closes. **All checks must PASS.**
+It trusts nothing: it re-walks all three firmware volumes, re-decompresses the
+patched module out of the image, re-disassembles the patch sites it finds (it
+detects which of the two patches an image carries and checks the rest of the
+image is untouched), recomputes the aperture arithmetic from the emitted
+immediates, and asserts every FFS checksum closes. **All checks must PASS.**
 
 ## Flashing
 
@@ -114,9 +161,10 @@ amdgpu: VRAM: 65520M      /dev/kfd present      rocminfo OK      P2P DMA registe
 | file | what |
 |---|---|
 | `patch_mmioh.py` | patch 1 — 64-bit MMIOH aperture (pure Python, raw image → raw image) |
-| `patch_aperture.py` | patch 2 — published 32-bit root-bridge aperture (MMTool module extract) |
+| `patch_aperture.py` | patch 2 — published 32-bit root-bridge aperture (pure Python, raw image → raw image, Tiano de/compression in-process) |
 | `verify_image.py` | independent verifier for the finished image |
-| `tools/mmtool_run.py` | ConPTY driver for MMTool 4.50's GUI-subsystem CLI |
+| `tools/mmtool_run.py` | ConPTY driver for MMTool 4.50's GUI-subsystem CLI (optional fallback route) |
+| `requirements.txt` | `uefi-firmware` (EDK2 codecs, patch 2) and `capstone` (disassembly in the verifier) |
 | `docs/FLASHING.md` | flashrom / AFUDOSU procedures, recovery |
 | `AGENTS.md` | the full technical reference: measured layouts, disassembly, checksum rules, dead ends |
 

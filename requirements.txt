@@ -1,0 +1,9 @@
+# Only patch_aperture.py needs anything: the compiled EDK2 Tiano/LZH (de)compressor
+# that lets it expand and re-compress a compressed FFS module inside the raw image.
+#
+#   pip install -r requirements.txt
+#
+# patch_mmioh.py and verify_image.py's structural checks need no packages;
+# verify_image.py's disassembly checks need capstone:
+capstone>=5.0
+uefi-firmware>=1.16

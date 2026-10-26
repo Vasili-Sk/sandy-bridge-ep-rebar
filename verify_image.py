@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""Independent structural + semantic verification of the combined flash image.
+"""Independent structural + semantic verification of a patched flash image.
 
-    python scripts/verify_final.py <stock.921> <final.bin>
+    python verify_image.py <stock.921> <patched.bin>
 
 Nothing here trusts the patchers: every claim is re-derived from the bytes.
 
-WHAT THIS IMAGE IS
-------------------
+WHAT THE IMAGES ARE
+-------------------
 stock = Supermicro X9DRGQF8.921 (3.3), 16 MiB raw SPI.
-final = stock
+final = stock + any subset of the two patches:
       + MMIOH aperture 1 TiB -> 8 TiB: 7 code bytes in the PEIM
         IvtQpiandMrcInit (FV02) + its FFS file-data checksum byte.
       + published root-bridge 32-bit MMIO aperture 0x80000000/0x7C000000 ->
         0x90000000/0x6C000000: 14 code bytes in the DXE driver PciRootBridge
-        (FV01) + its FFS file-data checksum byte.  MMTool's `/r` repacked FV01
-        (that module is stored uncompressed, so the whole volume shifts), so
-        FV01 is verified structurally rather than as a byte run.
+        (FV01) + its FFS file-data checksum byte.  That module lives inside
+        FV01 and may be stored compressed (Tiano) or uncompressed, and the
+        volume may have been repacked around it (files shifted), so FV01 is
+        verified structurally -- geometry, file count, every file's checksums,
+        and the module's code re-decompressed from the image -- rather than as
+        a byte run.  Which patches are present is detected from the bytes and
+        the corresponding region checks are applied.
 
 MEASURED LAYOUT FACTS THIS VERIFIER RELIES ON
 --------------------------------------------
@@ -53,6 +57,15 @@ import struct
 import sys
 import uuid
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CS_MODE_64
+
+# The DXE module this verifier checks is stored Tiano-compressed in FV01, so
+# re-deriving its code bytes needs the same compiled EDK2 codecs the patcher
+# uses (`pip install uefi-firmware>=1.16`).  Without it the module-level checks
+# are reported as skipped; everything structural still runs.
+try:
+    from uefi_firmware import efi_compressor as ec
+except ImportError:
+    ec = None
 
 PHYS = 46
 FV01 = (0x460000, 0xDD0000)
@@ -111,6 +124,43 @@ def runs(idxs):
         i = j + 1
     return out
 
+
+def sections(blob):
+    """Yield (type, body) for every section in an FFS file body / payload."""
+    p = 0
+    while p + 4 <= len(blob):
+        size = int.from_bytes(blob[p:p + 3], "little")
+        stype = blob[p + 3]
+        if not 4 <= size <= len(blob) - p:
+            return
+        yield stype, blob[p + 4:p + size]
+        p = (p + size + 3) & ~3
+
+
+def pe32_of(d, g):
+    """The PE32 image body of the FFS file whose GUID is at g, decompressed.
+
+    Handles both shapes a module can have here: PE32 section at the top level
+    (MMTool's /r shape, no compression section) and PE32 inside an
+    AMI/EDK2 COMPRESSION section (type 0x01, CompressionType 0x01 = Tiano).
+    """
+    size = int.from_bytes(d[g + 0x14:g + 0x17], "little")
+    for stype, body in sections(d[g + 0x18:g + size]):
+        if stype == 0x10:
+            return body
+        if stype == 0x01 and ec is not None:
+            dest, ctype = struct.unpack_from("<I", body, 0)[0], body[4]
+            if ctype != 0x01:
+                continue
+            buf = body[5:]                       # CompressedSize, DestinationSize, bitstream
+            out = ec.TianoDecompress(buf, dest + (1 << 20))
+            if len(out) != dest:
+                continue
+            for t2, b2 in sections(out):
+                if t2 == 0x10:
+                    return b2
+    return None
+
 stock_f, final_f = sys.argv[1], sys.argv[2]
 a, b = open(stock_f, "rb").read(), open(final_f, "rb").read()
 print(f"stock {stock_f}\n      {len(a):,} B  sha256 {hashlib.sha256(a).hexdigest()}")
@@ -126,16 +176,30 @@ for lo, hi, nm in [(0x000000, 0x400000, "flash descriptor / ME / NCB0"),
                    (0x420000, 0x460000, "NCB1"),
                    (0xDD0000, 0xE00000, "NCB2")]:
     chk(a[lo:hi] == b[lo:hi], f"{nm} {lo:#x}..{hi:#x}")
-chk(a[0xE00000:0xE26011] == b[0xE00000:0xE26011], "FV02 up to the checksum byte")
-chk(a[0xE26012:0xE3019E] == b[0xE26012:0xE3019E], "FV02 between the two sites")
-chk(a[0xE301A5:0x1000000] == b[0xE301A5:0x1000000], "FV02 from the site to end of image")
+
+S = 0x0E3019E                     # MMIOH size site, IvtQpiandMrcInit (FV02)
+MMIOH_ORIG = bytes.fromhex("0fb796c00200006685d2")
+mmioh = b[S:S + 10] != MMIOH_ORIG         # is patch 1 present in this image?
+chk(a[S:S + 10] == MMIOH_ORIG, "stock bytes at the MMIOH site are the original "
+                               "movzx/test pair")
+if mmioh:
+    chk(a[0xE00000:0xE26011] == b[0xE00000:0xE26011], "FV02 up to the checksum byte")
+    chk(a[0xE26012:0xE3019E] == b[0xE26012:0xE3019E], "FV02 between the two sites")
+    chk(a[0xE301A5:0x1000000] == b[0xE301A5:0x1000000], "FV02 from the site to end of image")
+else:
+    chk(a[0xE00000:] == b[0xE00000:], "FV02 (PEI + boot block) byte-identical to stock: "
+                                     "the MMIOH patch is not in this image")
 outside = [i for i in range(len(a)) if a[i] != b[i]
            if not (FV01[0] <= i < FV01[1])]
 info(f"outside FV01: {len(outside)} bytes in {len(runs(outside))} run(s) -> "
-     + ", ".join(f"{s:#x}+{n}" for s, n in runs(outside)))
-chk(len(runs(outside)) == 2 and runs(outside)[0] == (0xE26011, 1)
-    and runs(outside)[1] == (0xE3019E, 7),
-    "outside FV01 exactly 2 runs: 1 checksum byte + 7 code bytes")
+     + (", ".join(f"{s:#x}+{n}" for s, n in runs(outside)) or "none"))
+if mmioh:
+    chk(len(runs(outside)) == 2 and runs(outside)[0] == (0xE26011, 1)
+        and runs(outside)[1] == (0xE3019E, 7),
+        "outside FV01 exactly 2 runs: 1 checksum byte + 7 code bytes")
+else:
+    chk(not outside, "outside FV01: nothing at all (aperture-only patch, "
+                     "MMIOH untouched)")
 
 print("\n=== firmware volumes ===")
 va, vb = volumes(a), volumes(b)
@@ -149,7 +213,8 @@ for (h, ln, hc, hok, fa), (h2, ln2, hc2, hok2, fb) in zip(va, vb):
     chk([(s, at) for _, s, at in fa] == [(s, at) for _, s, at in fb]
         if h != FV01[0] else True,
         f"{t}: per-file size/attribute sequence unchanged" if h != FV01[0]
-        else f"{t}: (FV01 repacked by MMTool; sizes checked below)")
+        else f"{t}: (FV01 is the volume the aperture patch repacks; per-file "
+             f"sizes are expected to shift there)")
 
 print("\n=== FFS integrity: every file in every volume, final image ===")
 for (h, ln, _, _, fa), (h2, ln2, _, _, fb) in zip(va, vb):
@@ -164,30 +229,37 @@ for (h, ln, _, _, fa), (h2, ln2, _, _, fb) in zip(va, vb):
 print("\n=== patch site 1: MMIOH size (PEIM IvtQpiandMrcInit, FV02) ===")
 g4 = b.find(uuid.UUID("5C08C7C8-24C2-4400-9627-CF2869421E06").bytes_le)
 chk(g4 == 0xE26000, f"IvtQpiandMrcInit GUID at {g4:#x}")
-S = 0x0E3019E
 md32 = Cs(CS_ARCH_X86, CS_MODE_32)
 ins = {i.address: (i.mnemonic, i.op_str) for i in md32.disasm(b[S - 0x15:S + 0x14], S - 0x15)}
 for ad in sorted(ins):
     mark = "  <== patched" if S <= ad <= S + 5 else ""
     print(f"    {ad:#09x}  {ins[ad][0]:8s} {ins[ad][1]}{mark}")
-chk(a[S:S + 10] == bytes.fromhex("0fb796c00200006685d2"),
+chk(a[S:S + 10] == MMIOH_ORIG,
     "stock bytes here are movzx edx,[esi+0x2c0] ; test dx,dx")
-chk(ins[S] == ("mov", "edx, 0x2000"), f"{S:#x} now decodes as mov edx, 0x2000")
-chk(ins[S + 5][0] in ("nop", "xchg"), "padding decodes as a real nop")
-chk(ins[S + 7] == ("test", "dx, dx"), "original test dx,dx preserved")
-chk(ins[S + 0xA][0] == "jne", "original jne preserved (non-zero -> size used)")
+if not mmioh:
+    info("MMIOH patch not present in this image (aperture-only build); "
+         "site 1 checks skipped, FV02 verified byte-identical above")
+if mmioh:
+    chk(ins[S] == ("mov", "edx, 0x2000"), f"{S:#x} now decodes as mov edx, 0x2000")
+    chk(ins[S + 5][0] in ("nop", "xchg"), "padding decodes as a real nop")
+    chk(ins[S + 7] == ("test", "dx, dx"), "original test dx,dx preserved")
+    chk(ins[S + 0xA][0] == "jne", "original jne preserved (non-zero -> size used)")
 size_gib = struct.unpack_from("<I", b, S + 1)[0]
 base_u4g = struct.unpack_from("<I", b, 0x0E3018C)[0]
 mult = struct.unpack_from("<I", b, 0x0E301DE)[0]
 chk(mult == 0x40000000, f"callee multiplier {mult:#x} = 1 GiB -> field unit is GiB")
-chk(size_gib & (size_gib - 1) == 0 and size_gib <= 0xFFFF,
-    f"size {size_gib:#x} GiB is a power of two and fits the 16-bit field")
-base_addr, top = base_u4g << 32, (base_u4g << 32) + (size_gib << 30)
-chk(base_u4g == 0x3800, f"base {base_u4g:#x} x 4 GiB = {base_addr>>40} TiB")
-chk(top == 1 << PHYS, f"window {base_addr:#x}..{top-1:#x} ends exactly at 2^{PHYS}")
-chk(size_gib << 30 >= 64 << 30, f"{size_gib<<30>>30} GiB covers a 64 GiB MI210 BAR0")
-chk((sum(b[g4+0x18:g4+int.from_bytes(b[g4+0x14:g4+0x17],'little')]) + b[g4+0x11]) & 0xFF == 0,
-    f"IvtQpiandMrcInit file-data checksum recomputed ({b[g4+0x11]:#04x})")
+chk(base_u4g == 0x3800, f"base {base_u4g:#x} x 4 GiB = {base_u4g << 32 >> 40} TiB")
+if mmioh:
+    chk(size_gib & (size_gib - 1) == 0 and size_gib <= 0xFFFF,
+        f"size {size_gib:#x} GiB is a power of two and fits the 16-bit field")
+    base_addr, top = base_u4g << 32, (base_u4g << 32) + (size_gib << 30)
+    chk(top == 1 << PHYS, f"window {base_addr:#x}..{top-1:#x} ends exactly at 2^{PHYS}")
+    chk(size_gib << 30 >= 64 << 30, f"{size_gib<<30>>30} GiB covers a 64 GiB MI210 BAR0")
+    chk((sum(b[g4+0x18:g4+int.from_bytes(b[g4+0x14:g4+0x17],'little')]) + b[g4+0x11]) & 0xFF == 0,
+        f"IvtQpiandMrcInit file-data checksum recomputed ({b[g4+0x11]:#04x})")
+else:
+    chk((sum(b[g4+0x18:g4+int.from_bytes(b[g4+0x14:g4+0x17],'little')]) + b[g4+0x11]) & 0xFF == 0,
+        f"IvtQpiandMrcInit file-data checksum still closes ({b[g4+0x11]:#04x}, untouched)")
 
 print("\n=== patch site 2: published root-bridge aperture (DXE PciRootBridge, FV01) ===")
 G9 = uuid.UUID("80E66E0A-CCD1-43FA-A7B1-2D5EE0F13910").bytes_le
@@ -200,24 +272,63 @@ for tag, d, g in (("stock", a, g9a), ("final", b, g9)):
           f"state {d[g+0x17]:#04x}  hdr {'OK' if hdr else 'BAD'} file {'OK' if fil else 'BAD'}")
     chk(hdr and fil, f"{tag}: PciRootBridge FFS checksums close")
 chk(b[g9 + 0x13] == a[g9a + 0x13], f"FFS Attributes preserved ({b[g9+0x13]:#04x})")
-md64 = Cs(CS_ARCH_X86, CS_MODE_64)
-for pat, want, nm in ((bytes.fromhex("41b90000009090"), 0x90000000, "MBB"),
-                      (bytes.fromhex("41b90000006c90"), 0x6C000000, "MBL")):
-    h = [m.start() for m in re.finditer(re.escape(pat), b)]
-    chk(len(h) == 1, f"{nm}: 'mov r9d,{want:#x}; nop' occurs exactly once in 16 MiB")
-    seq = list(md64.disasm(b[h[0]:h[0] + 0x38], 0))
-    chk(seq[0].mnemonic == "mov" and seq[0].op_str == f"r9d, {want:#x}",
-        f"{nm}: decodes as mov r9d, {want:#x}")
-    chk(seq[1].mnemonic in ("nop", "xchg"), f"{nm}: padding is a real nop")
-    chk(any(i.mnemonic == "call" for i in seq), f"{nm}: followed by the DSDT writer call")
-    chk(any(i.mnemonic == "lea" and "rip" in i.op_str for i in seq),
-        f"{nm}: the AMI resource-name string is loaded for the same call")
-chk(len([m for m in re.finditer(re.escape(bytes.fromhex("4c8b8f68010000")), b)]) == 0,
-    "the original mov r9,[rdi+0x168] is gone from the image")
-chk(len([m for m in re.finditer(re.escape(bytes.fromhex("4c8b8f70010000")), b)]) == 0,
-    "the original mov r9,[rdi+0x170] is gone from the image")
+pe_a, pe_b = pe32_of(a, g9a), pe32_of(b, g9)
+aperture = False
+if pe_a is None or pe_b is None:
+    chk(False, "PE32 image recovered from both PciRootBridge modules "
+               f"(stock {'ok' if pe_a else 'FAILED'}, final {'ok' if pe_b else 'FAILED'}; "
+               f"codec {'loaded' if ec else 'NOT installed - pip install uefi-firmware>=1.16'})")
+else:
+    info(f"PE32 image recovered from both modules: stock {len(pe_a):,} B, "
+         f"final {len(pe_b):,} B"
+         + (" (Tiano-decompressed)" if ec else " (stored uncompressed)"))
+    md64 = Cs(CS_ARCH_X86, CS_MODE_64)
+    SITES = ((bytes.fromhex("41b90000009090"), 0x90000000, "MBB",
+              bytes.fromhex("4c8b8f68010000")),
+             (bytes.fromhex("41b90000006c90"),
+              0x6C000000, "MBL", bytes.fromhex("4c8b8f70010000")))
+    # Like patch 1, patch 2 is detected from the bytes: an image may carry either,
+    # both, or neither, and the verifier must say which rather than cry wolf.
+    aperture = all(pat in pe_b for pat, _w, _n, _o in SITES)
+    if not aperture:
+        info("patch 2 (published aperture) is NOT present in this image: the two stock "
+             "loads are intact, so its code checks are skipped")
+        for _p, _w, nm, orig in SITES:
+            chk(len(re.findall(re.escape(orig), pe_b)) == 1,
+                f"{nm}: the unpatched module still has its stock load")
+        chk(pe_a == pe_b,
+            "the PciRootBridge PE32 image is byte-identical to stock (patch 2 not applied)")
+    else:
+        sites = []
+        for pat, want, nm, orig in SITES:
+            h = [m.start() for m in re.finditer(re.escape(pat), pe_b)]
+            chk(len(h) == 1, f"{nm}: 'mov r9d,{want:#x}; nop' occurs exactly once in the "
+                              f"final module's PE32 image")
+            chk(len([m for m in re.finditer(re.escape(orig), pe_a)]) == 1,
+                f"{nm}: the stock module has exactly one mov r9,[rdi+{int.from_bytes(orig[3:7], 'little'):#x}] "
+                f"at PE32 offset {pe_a.find(orig):#x}")
+            chk(len([m for m in re.finditer(re.escape(orig), pe_b)]) == 0,
+                f"{nm}: the original load is gone from the final module")
+            o = h[0]
+            sites.append((o, nm))
+            seq = list(md64.disasm(pe_b[o:o + 0x38], 0))
+            chk(seq[0].mnemonic == "mov" and seq[0].op_str == f"r9d, {want:#x}",
+                f"{nm}: decodes as mov r9d, {want:#x}")
+            chk(seq[1].mnemonic in ("nop", "xchg"), f"{nm}: padding is a real nop")
+            chk(any(i.mnemonic == "call" for i in seq), f"{nm}: followed by the DSDT writer call")
+            chk(any(i.mnemonic == "lea" and "rip" in i.op_str for i in seq),
+                f"{nm}: the AMI resource-name string is loaded for the same call")
+        chk(len(pe_a) == len(pe_b), "module code length unchanged by the patch")
+        n = sum(1 for x, y in zip(pe_a, pe_b) if x != y)
+        chk(n == 14, f"exactly {n} bytes differ between the stock and final PE32 images "
+                     f"(2 x 7 code bytes)")
+        dr = runs([i for i in range(len(pe_a)) if pe_a[i] != pe_b[i]])
+        chk(dr == sorted((o, 7) for o, _n in sites),
+            "the only bytes that differ in the whole 90 KB PE32 image are the two "
+            "7-byte sites: " + ", ".join(f"{o:#x}+7 ({nm})" for o, nm in sites))
 
-print("\n=== the aperture the OS will be told about ===")
+print("\n=== the aperture the OS will be told about"
+      + (" ===" if aperture else " (the values patch 2 would publish) ==="))
 MBB, MBL, MMCFG_BASE, MMCFG_SIZE, TOM = 0x90000000, 0x6C000000, 0x80000000, 0x10000000, 0xFC000000
 chk(MBB == MMCFG_BASE + MMCFG_SIZE, f"MBB {MBB:#x} == MMCFG base + MMCFG size")
 chk(MBL == TOM - MBB, f"MBL {MBL:#x} == {TOM:#x} - MBB")
