@@ -161,7 +161,45 @@ def pe32_of(d, g):
                     return b2
     return None
 
-stock_f, final_f = sys.argv[1], sys.argv[2]
+def structure_only(path):
+    """Validate one image's firmware structure -- no baseline, no patch checks.
+
+    This is the mode a flashing script calls before writing. It answers exactly
+    one question: are the FFS checksums in this image valid? A build with a stale
+    file-data checksum is bootable by this firmware but structurally broken (it
+    truncates MMTool's volume walk, and a broken *header* checksum is what killed
+    the rev-1 board -- see AGENTS.md §7), so it is a hard gate on a flash.
+    """
+    d = open(path, "rb").read()
+    print(f"image {path}\n      {len(d):,} B  sha256 {hashlib.sha256(d).hexdigest()}")
+    chk(len(d) == 16 * 1024 * 1024, f"16 MiB ({len(d):,} B)")
+    chk(struct.unpack_from("<I", d, 0x10)[0] == 0x0FF0A55A,
+        "flash descriptor signature at 0x10 intact")
+    vs = volumes(d)
+    chk(len(vs) == 3, f"3 firmware volumes ({len(vs)})")
+    hdrs = sum(1 for _, _, _, hok, _ in vs if hok)
+    info(f"FV headers     : FV header checksum field closes on {hdrs}/{len(vs)} "
+         "(stock ships 0/3; informational -- the board boots with it broken)")
+    tf = th = tfl = 0
+    for h, ln, _, _, fs in vs:
+        cl = [closes(d, g, s, at) for g, s, at in fs]
+        nh, nf = sum(x for x, _ in cl), sum(y for _, y in cl)
+        tf += len(fs); th += nh; tfl += nf
+        if nh != len(fs) or nf != len(fs):
+            print(f"  INVALID: FV @ {h:#x} len {ln:#x}: FFS headers {nh}/{len(fs)}, "
+                  f"FFS file data {nf}/{len(fs)}")
+    print(f"  FFS headers    : {th}/{tf} close")
+    print(f"  FFS file data  : {tfl}/{tf} close")
+    chk(th == tf and tfl == tf, "every FFS header and file-data checksum closes")
+    print("\n" + ("STRUCTURE OK" if ok else "STRUCTURE INVALID - do not flash"))
+    sys.exit(0 if ok else 1)
+
+
+_args = [x for x in sys.argv[1:] if x != "--structure-only"]
+if len(_args) == 1:
+    structure_only(_args[0])
+
+stock_f, final_f = _args[0], _args[1]
 a, b = open(stock_f, "rb").read(), open(final_f, "rb").read()
 print(f"stock {stock_f}\n      {len(a):,} B  sha256 {hashlib.sha256(a).hexdigest()}")
 print(f"final {final_f}\n      {len(b):,} B  sha256 {hashlib.sha256(b).hexdigest()}\n")

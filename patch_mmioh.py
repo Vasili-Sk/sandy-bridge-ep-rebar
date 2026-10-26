@@ -64,6 +64,15 @@ PHYS = 46                                              # E5-2690 v2: 46-bit PAE
 BASE = 0x3800                                          # default base, units of 4 GiB
 
 
+_FIRMWARE_EXT = re.compile(r"\.(bin|rom|cap|img|fd)$", re.I)
+
+
+def stem(path):
+    r"""Basename with a *firmware* extension removed.  `X9DRGQF8.921` carries its
+    version in the trailing `.921`, which a generic `\.[^.]+$` strip would eat."""
+    return _FIRMWARE_EXT.sub("", os.path.basename(path))
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Raise the C600-series MMIOH 64-bit MMIO aperture (the ReBAR enabler).",
@@ -78,7 +87,9 @@ def main():
 
     def TiB(n): return f"{n/1024:g} TiB"
     def hb(n):
-        u = ['B','KB','MB','GB','TB','PB']
+        # divided by 1024, so these are BINARY units and must be labelled so:
+        # 0x380000000000 is 56 TiB = 61.6 TB. Labelling it "TB" is a 10% lie.
+        u = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']
         i = 0
         while n >= 1024 and i < 5: n /= 1024; i += 1
         return f"{n:g} {u[i]}"
@@ -140,8 +151,7 @@ def main():
     assert (sum(h) + d[g+0x10]) & 0xFF == 0, "header checksum does not close"
     print(f"FFS header checksum   : {d[g+0x10]:#04x} (unchanged, verified closes)")
 
-    dst = a.out or (re.sub(r"\.[^.]+$", "", os.path.basename(a.src))
-                    + f".mmioh-{a.size:#x}.bin")
+    dst = a.out or (stem(a.src) + f".mmioh-{a.size:#x}.bin")
     open(dst, "wb").write(bytes(d))
 
     diff = [i for i in range(len(orig)) if orig[i] != d[i]]
@@ -157,7 +167,7 @@ def main():
     print(f"MMIOH size         {size_bytes:#014x}  ({hb(size_bytes)})   [{a.size:#x} GiB]")
     print(f"MMIOH mask         {size_bytes-1:#014x}   (= size-1, base/mask decoder)")
     print(f"MMIOH window       {base_addr:#014x} .. {top-1:#014x}")
-    print(f"top of 46-bit space{((1<<PHYS)-1):#014x}   -> window ends "
+    print(f"top of 46-bit space  {((1<<PHYS)-1):#014x}   -> window ends "
           f"{'EXACTLY at' if top == 1<<PHYS else ('above' if top > 1<<PHYS else 'below')} 2^{PHYS}")
     print()
     print(f"bytes changed      {len(diff)}: {[hex(x) for x in diff]}")

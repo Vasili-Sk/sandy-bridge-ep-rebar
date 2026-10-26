@@ -95,14 +95,16 @@ checks that identity and aborts if it does not hold.
 
 REBUILD
 -------
-default (recompress):  hdr + DEPEx + COMPRESSION(TianoCompress(payload))
-                       -> the stream grows 45,606 -> 45,628 B, the module
-                          0xB29B -> 0xB2AE (+19), FV01 shifts by 16 B.
---store-uncompressed:  hdr + DEPEx + PE32 + UI, no compression section
+default (uncompressed): hdr + DEPEx + PE32 + UI, no compression section
                        -> module grows to 90,472 B (0x16168); FV01 shifts by
-                          44,744 B.
-                       This is the shape MMTool's `/r` produces; kept as a
-                       cross-check.  With --from-extract it needs no codec.
+                          44,744 B (FV01 keeps 803,128 B free afterwards).
+                       This is byte-for-byte the shape MMTool's `/r` produces and
+                       stock already ships an uncompressed module in FV01, so it is
+                       the shape to flash.  With --from-extract it needs no codec.
+--recompress:          hdr + DEPEx + COMPRESSION(TianoCompress(payload))
+                       -> the stream grows 45,606 -> 45,628 B, the module
+                          0xB29B -> 0xB2AE (+19), FV01 shifts by 16 B. Smaller,
+                       but the board decompresses an EDK2-encoded stream.
 
 Both forms keep Attributes (0x40 = FFS_ATTRIB_CHECKSUM) and State, rewrite the
 24-bit Size, and recompute the two live FFS checksums (AGENTS.md "FFS
@@ -504,6 +506,15 @@ def runs_of(diffs):
 
 
 # ------------------------------------------------------------------- main
+_FIRMWARE_EXT = re.compile(r"\.(bin|rom|cap|img|fd)$", re.I)
+
+
+def stem(path):
+    r"""Basename with a *firmware* extension removed.  `X9DRGQF8.921` carries its
+    version in the trailing `.921`, which a generic `\.[^.]+$` strip would eat."""
+    return _FIRMWARE_EXT.sub("", os.path.basename(path))
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Shrink the published root-bridge 32-bit MMIO aperture so it no "
@@ -516,10 +527,16 @@ def main():
     ap.add_argument("--module-out", metavar="FILE",
                     help="also write the rebuilt module (this image's shape) there")
     ap.add_argument("--guid", default=GUID, help="module GUID (default PciRootBridge)")
+    ap.add_argument("--recompress", action="store_true",
+                    help="re-compress the patched module with Tiano instead of storing "
+                         "it uncompressed. Moves ~16 bytes of FV01 instead of ~45 KB "
+                         "and needs no free-space headroom, but the firmware then "
+                         "decompresses a stream written by EDK2's encoder rather than "
+                         "AMI's. OFF by default: the uncompressed shape is what MMTool's "
+                         "/r produces and stock module 022 (BdsS3Logo) proves this volume "
+                         "stores raw, so it is the shape to flash.")
     ap.add_argument("--store-uncompressed", action="store_true",
-                    help="drop the COMPRESSION section and store the module "
-                         "uncompressed (MMTool's /r shape). Default recompresses "
-                         "with Tiano, which moves ~16 bytes instead of ~45 KB.")
+                    help=argparse.SUPPRESS)   # now the default; accepted as a no-op
     ap.add_argument("--from-extract", metavar="FILE",
                     help="take the module payload from an MMTool `/e` extract "
                          "instead of decompressing the image (needs no codec)")
@@ -530,6 +547,15 @@ def main():
     ap.add_argument("--no-write", action="store_true",
                     help="do everything except write the image")
     a = ap.parse_args()
+
+    # The uncompressed shape is the default: it is byte-for-byte what MMTool's /r
+    # writes, it is the shape the `--reference-extract` gate is defined against, and
+    # stock already ships an uncompressed module in FV01 (022 BdsS3Logo), so the
+    # firmware is known to accept it. Recompressing is smaller but hands the board's
+    # decompressor a stream from a different encoder than the one that built the ROM.
+    recompress = bool(a.recompress)
+    if a.store_uncompressed and recompress:
+        die("--store-uncompressed and --recompress contradict each other")
 
     if not os.path.isfile(a.image):
         die("no such file: %s\n"
@@ -622,7 +648,7 @@ def main():
         print("  gate: unpatched rebuild == MMTool extract %s, byte for byte (%d B)"
               % (os.path.basename(a.reference_extract), len(ref)))
 
-    if not a.store_uncompressed and ec is None:
+    if recompress and ec is None:
         ec = load_codec()
 
     # ---- patch ------------------------------------------------------------
@@ -635,19 +661,19 @@ def main():
                  int.from_bytes(pat[3:7], "little"), val))
 
     # ---- rebuild ----------------------------------------------------------
-    built = mod.build(recompress=not a.store_uncompressed, ec=ec)
+    built = mod.build(recompress=recompress, ec=ec)
     chk = Module(built, "rebuilt module")
     chk.decode(ec)
     if chk.pe32 != mod.pe32:
         die("self-check: the rebuilt module does not decode back to the patched "
             "PE32 body")
-    if a.store_uncompressed and chk.ctype is not None:
-        die("self-check: --store-uncompressed output still has a COMPRESSION "
+    if not recompress and chk.ctype is not None:
+        die("self-check: the uncompressed output still has a COMPRESSION "
             "section")
     print("\nmodule rebuilt: 0x%x -> 0x%x bytes (%+d), %s"
           % (size, len(built), len(built) - size,
-             "uncompressed (MMTool /r shape)" if a.store_uncompressed
-             else "Tiano-recompressed"))
+             "Tiano-recompressed" if recompress
+             else "uncompressed (MMTool /r shape)"))
     print("  FFS header chksum %02x -> %02x   file chksum %02x -> %02x   "
           "attrs %02x preserved, state %02x preserved"
           % (img[off + 0x10], built[0x10], img[off + 0x11], built[0x11],
@@ -661,8 +687,7 @@ def main():
 
     # ---- repack the volume ------------------------------------------------
     out, delta, tail_len = repack(img, fv, off, size, built)
-    dst = a.out or (re.sub(r"\.[^.]+$", "", os.path.basename(a.image))
-                    + ".aperture.bin")
+    dst = a.out or (stem(a.image) + ".aperture.bin")
     open(dst, "wb").write(bytes(out))
 
     # ---- verify what we just wrote, from the bytes ------------------------
@@ -719,7 +744,7 @@ def main():
     print("\n%-22s %s" % ("module", "%s @0x%07x" % (guid, off)))
     print("%-22s 0x%x -> 0x%x bytes (%+d), %s"
           % ("module size", size, len(built), len(built) - size,
-             "stored uncompressed" if a.store_uncompressed else "Tiano-recompressed"))
+             "Tiano-recompressed" if recompress else "stored uncompressed"))
     print("%-22s %d bytes (%s)" % ("bytes changed", len(d0),
                                    ", ".join("%#x+%d" % (s, n) for s, n in rr[:6])))
     zone = stock[off:base + ln]
